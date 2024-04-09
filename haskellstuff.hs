@@ -39,6 +39,7 @@ class Null a where
 instance Null Eps
 
 data Event a da where
+    EpsEv :: Event Eps Eps
     IntEv :: Int -> Event Int Eps
     CatEvA :: Event s ds -> Event (s,t) (ds,t)
     CatPunc :: Null s => Event (s,t) t
@@ -50,7 +51,8 @@ data Events a da where
     ConsEvents :: Event s ds -> Events ds dds -> Events s dds
 
 data Folder a r where
-    Folder :: ((forall da. Maybe (Event a da,Folder da r) -> r) -> r) -> Folder a r
+    Folder :: ((forall da. Event a da -> Folder da r -> r) -> r) -> Folder a r
+
 
 data Stream a where
     S :: forall a. (forall r. Folder a r) -> Stream a
@@ -62,26 +64,26 @@ emptyStream = S (Folder (\k -> k Nothing))
 fromList :: [Int] -> Stream [Int]
 fromList xs = S (Folder (f1 xs))
     where
-        f1 :: [Int] -> (forall da. Maybe (Event [Int] da, Folder da r) -> r) -> r
-        f1 [] k = k Nothing
+        f1 :: [Int] -> (forall da. Event [Int] da -> Folder da r -> r) -> r
+        f1 [] k = k _ _
         f1 (x:xs) k = k (Just (ListPuncIn,Folder (f2 x xs)))
 
-        f2 :: Int -> [Int] -> (forall da. Maybe (Event (Int, [Int]) da, Folder da r) -> r) -> r
+        f2 :: Int -> [Int] -> (forall da. Event (Int, [Int]) da -> Folder da r -> r) -> r
         f2 x xs k = k (Just (CatEvA (IntEv x),Folder (f3 xs)))
 
-        f3 :: [Int] -> (forall da. Maybe (Event (Eps, [Int]) da, Folder da r) -> r) -> r
+        f3 :: [Int] -> (forall da. Event (Eps, [Int]) da -> Folder da r -> r) -> r
         f3 xs k = k (Just (CatPunc,Folder (f1 xs)))
 
 zeroes :: Stream [Int]
 zeroes = S (Folder f1)
     where
-        f1 :: (forall da. Maybe (Event [Int] da, Folder da r) -> r) -> r
+        f1 :: (forall da. Event [Int] da ->  Folder da r -> r) -> r
         f1 k = k (Just (ListPuncIn,Folder f2))
 
-        f2 :: (forall da. Maybe (Event (Int, [Int]) da, Folder da r) -> r) -> r
+        f2 :: (forall da. Event (Int, [Int]) da -> Folder da r -> r) -> r
         f2 k = k (Just (CatEvA (IntEv 0),Folder f3))
 
-        f3 :: (forall da. Maybe (Event (Eps, [Int]) da, Folder da r) -> r) -> r
+        f3 :: (forall da. Event (Eps, [Int]) da -> Folder da r -> r) -> r
         f3 k = k (Just (CatPunc,Folder f1))
 
 ssum :: Stream [Int] -> Int
@@ -98,6 +100,13 @@ ssum (S (Folder f)) = f (go 0)
         go'' :: Int -> Maybe (Event (Eps, [Int]) da, Folder da Int) -> Int
         go'' acc Nothing = acc
         go'' acc (Just (CatPunc,(Folder f) :: Folder [Int] Int)) = f (go acc)
+
+-- double :: Stream [Int] -> Stream [Int]
+-- double (S (Folder f)) = f go
+--     where
+--         go :: Maybe (Event [Int] da, Folder da (Stream [Int])) -> Stream [Int]
+--         go Nothing = S (Folder (\k -> k Nothing))
+--         go (Just (ListPuncDone))
 
 addUp = ssum (fromList [1,2,3,4])
 
