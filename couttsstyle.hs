@@ -10,6 +10,10 @@ import Control.Monad (void, liftM2)
 import Control.Monad.Identity (Identity(runIdentity))
 import qualified Data.Bifunctor
 import Control.Applicative (liftA2)
+import Control.Monad.State.Strict
+import Data.Maybe (fromMaybe)
+import Data.Map (Map)
+import qualified Data.Map as Map
 
 {- Inspired by "Stream Fusion" -}
 
@@ -61,7 +65,7 @@ stail (S (SF x0 next)) = S $ SF (x0,False) $
     \case
         (next -> Done,_) -> Done
         (next -> Skip x,b) -> Skip (x,b)
-        (next -> Yield a x,False) -> Skip (x,False)
+        (next -> Yield a x,False) -> Skip (x,True)
         (next -> Yield a x,True) -> Yield a (x,True)
 
 smap :: (a -> b) -> Stream a -> Stream b
@@ -71,20 +75,34 @@ smap f (S (SF x0 next)) = S $ SF x0 $
         (next -> Skip x) -> Skip x
         (next -> Yield a x) -> Yield (f a) x
 
-sstatefulmap :: s -> (a -> s -> (s,Maybe b)) -> Stream a -> Stream b
+smapMaybe :: (a -> Maybe b) -> Stream a -> Stream b
+smapMaybe f (S (SF x0 next)) = S $ SF x0 $
+    \case
+        (next -> Done) -> Done
+        (next -> Skip x) -> Skip x
+        (next -> Yield (f -> Nothing) x) -> Skip x
+        (next -> Yield (f -> Just b) x) -> Yield b x
+
+sfilter :: (a -> Bool) -> Stream a -> Stream a
+sfilter f = smapMaybe (\x -> if f x then Just x else Nothing)
+
+sstatefulmap :: s -> (a -> State s (Maybe b)) -> Stream a -> Stream b
 sstatefulmap y0 f (S (SF x0 next)) = S $ SF (x0,y0) $
     \case
         (next -> Done,_) -> Done
         (next -> Skip x,y) -> Skip (x,y)
-        (next -> Yield a x,y) -> case f a y of
-                                    (y',Just b) -> Yield b (x,y')
-                                    (y',Nothing) -> Skip (x,y')
+        (next -> Yield a x,y) -> case runState (f a) y of
+                                    (Just b,y') -> Yield b (x,y')
+                                    (Nothing,y') -> Skip (x,y')
 
 sapplyFirst :: (a -> a) -> Stream a -> Stream a
-sapplyFirst f = sstatefulmap False $ curry $
-    \case
-        (a,False) -> (True, Just (f a))
-        (a,True) -> (True, Just a)
+sapplyFirst f = sstatefulmap False $ \a -> do
+    pastFirst <- get
+    if pastFirst then do
+        return (Just a)
+    else do
+        put True
+        return (Just (f a))
 
 sbind :: Stream a -> (a -> Stream b) -> Stream b
 sbind (S (SF x0 next)) f = S $ SF (x0,Nothing) $
@@ -164,16 +182,35 @@ stakeWhile p (S (SF x0 next)) = S $ SF x0 next'
         next' (next -> Skip x) = Skip x
         next' (next -> Yield a x) = if p a then Yield a x else Done
 
+
+stakeWhileSt :: s -> (a -> State s Bool) -> Stream a -> Stream a
+stakeWhileSt x0 f (S (SF y0 next)) = S (SF (y0,x0) next')
+    where
+        next' (next -> Done,_) = Done
+        next' (next -> Skip y,x) = Skip (y,x)
+        next' (next -> Yield a y,x) = let (b,x') = runState (f a) x in if b then Yield a (y,x') else Done
+
 sdropWhile :: (a -> Bool) -> Stream a -> Stream a
-sdropWhile p (S (SF x0 next)) = S $ SF (x0,False) next'
+sdropWhile p (S (SF x0 next)) = S $ SF (x0,True) next'
     where
         next' (next -> Done,_) = Done
         next' (next -> Skip x,b) = Skip (x,b)
-        next' (next -> Yield a x,True) = Yield a (x,True)
-        next' (next -> Yield a x,False) = if p a then Skip (x,False) else Yield a (x,True)
+        next' (next -> Yield a x,False) = Yield a (x,True)
+        next' (next -> Yield a x,True) = if p a then Skip (x,True) else Yield a (x,False)
 
-ssplitOn :: (a -> Bool) -> Stream a -> (Stream a, Stream a)
-ssplitOn p s = (stakeWhile p s, sdropWhile p s)
+sdropWhileSt :: s -> (a -> State s Bool) -> Stream a -> Stream a
+sdropWhileSt x0 f (S (SF y0 next)) = S (SF (y0,x0,True) next')
+    where
+        next' (next -> Done,_,_) = Done
+        next' (next -> Skip y,x,b) = Skip (y,x,b)
+        next' (next -> Yield a y,x,False) = Yield a (y,x,False)
+        next' (next -> Yield a y,x,True) = let (b,x') = runState (f a) x in if b then Skip (y,x',True) else Yield a (y,x',False)
+
+
+sspan :: (a -> Bool) -> Stream a -> (Stream a, Stream a)
+sspan p s = (stakeWhile p s, sdropWhile p s)
+
+-- (sappend (stakewhile p s) (sdropwhile p s)) == s
 
 spartition :: (a -> Either b c) -> Stream a -> (Stream b, Stream c)
 spartition f (S (SF x0 next)) = (S (SF x0 next1), S (SF x0 next2))
@@ -195,7 +232,10 @@ sFromList :: [a] -> Stream a
 sFromList = foldr scons ssink
 
 sToList :: Stream a -> [a]
-sToList = foldr (:) []
+sToList = foldr (\x xs -> xs ++ [x]) []
+
+instance Show a => Show (Stream a) where
+    show = show . sToList
 
 sMux :: Stream (a -> Either b c) -> Stream a -> (Stream b,Stream c)
 sMux fs as =
@@ -210,17 +250,21 @@ sRepeatFirst (S (SF x0 next)) = S $ SF (x0,Nothing) $
         (next -> Yield a x,Nothing) -> Yield a (x,Just a)
         s@(x,Just a) -> Yield a s
 
-{- applies the condition to the first element of the input stream, and then switches to one or the other -}
-sIf :: (a -> Bool) -> Stream a -> (Stream a, Stream a)
-sIf p (S (SF x0 next)) = (S $ SF (x0,False) yes, S $ SF (x0,False) no)
-    where
-        yes (next -> Skip x,False) = Skip (x,False)
-        yes (next -> Yield a x, False) = if p a then Yield a (x,True) else Done
-        yes (x,True) = stepStateMap (,True) $ next x
 
-        no (next -> Skip x,False) = Skip (x,False)
-        no (next -> Yield a x, False) = if not (p a) then Yield a (x,True) else Done
-        no (x,True) = stepStateMap (,True) $ next x
+
+{- applies the condition to the first element of the input stream, and then switches to one or the other -}
+sIf :: (a -> Bool) -> Stream a -> Stream b -> Stream b -> Stream b
+sIf p (S (SF x0 next)) (S (SF y0 next0)) (S (SF y1 next1)) = S (SF (Left x0) next')
+    where
+        next' (Left (next -> Done)) = Done
+        next' (Left (next -> Skip x)) = Skip (Left x)
+        next' (Left (next -> Yield a _)) = if p a then Skip (Right (Left y0)) else Skip (Right (Right y1))
+        next' (Right (Left (next0 -> Done))) = Done
+        next' (Right (Left (next0 -> Skip y))) = Skip (Right (Left y))
+        next' (Right (Left (next0 -> Yield b y))) = Yield b (Right (Left y))
+        next' (Right (Right (next1-> Done))) = Done
+        next' (Right (Right (next1 -> Skip y))) = Skip (Right (Right y))
+        next' (Right (Right (next1 -> Yield b y))) = Yield b (Right (Right y))
 
 
 instance Monad Stream where
@@ -260,67 +304,199 @@ instance Functor Stream where
             (next -> Skip x) -> Skip x
             (next -> Yield a x) -> Yield (f a) x
 
+data Ty = TyEps | TyInt | TyCat Ty Ty deriving (Eq,Ord,Show)
+
+isNull :: Ty -> Bool
+isNull TyEps = True
+isNull TyInt = False
+isNull (TyCat {}) = False
+
 data Term where
-    -- EpsR :: Term
-    -- Nil :: Term
-    Var :: String -> Term
+    EpsR :: Term
+    IntR :: Int -> Term
+    Var :: String -> Ty -> Term
     IntCase :: String -> Term -> Term -> Term
     CatL :: String -> String -> String -> Term -> Term
-    -- Cons :: Term -> Term -> Term
-    -- CatR :: Term -> Term -> Term
+    CatR :: Ty -> Term -> Term -> Term
 
-data Event where
-    IntEv :: Int -> Event
+data Event = IntEv Int | CatEvA Event | CatPunc deriving (Eq,Ord,Show)
+    -- IntEv :: Int -> Event
     -- ListEvDone :: Event
     -- ListEvNext :: Event
-    CatEvA :: Event -> Event
-    CatPunc :: Event
-
-data TaggedEvent = TEV String Event
-
--- catSwitch :: (MonadError SemError m) => Ty -> MSF m TaggedEvent [Event] -> MSF m TaggedEvent [Event] -> MSF m TaggedEvent [Event]
--- catSwitch s m1 m2 = dSwitch (feedback s ((m1 *** returnA) >>> (maximalCheck &&& msfDeriv))) (const m2)
---     where
---         maximalCheck = arrM $ \(evs,s') ->
---                 if Event.isMaximal s' evs then
---                     return (fmap CatEvA evs ++ [CatPunc], Just ())
---                 else
---                     return (fmap CatEvA evs, Nothing)
+    -- CatEvA :: Event -> Event
+    -- CatPunc :: Event
 
 
-denote :: Term -> (Stream TaggedEvent -> Stream Event)
--- denote EpsR _ = ssink
--- denote Nil _ = return ListEvDone
-denote (Var x) (S (SF st next)) = S $ SF st $
-    \case
-        (next -> Skip st) -> Skip st
-        (next -> Done) -> Done
-        (next -> Yield (TEV y ev) st) | x == y -> Yield ev st
-        (next -> Yield _ st) -> Skip st
+data TaggedEvent = TEV String Event deriving (Eq,Ord,Show)
+
+deriv :: Ty -> Event -> Ty
+deriv TyEps _ = error ""
+deriv TyInt (IntEv _) = TyEps
+deriv TyInt _ = error ""
+deriv (TyCat s t) (CatEvA ev) = TyCat (deriv s ev) t
+deriv (TyCat _ t) CatPunc = t
+deriv (TyCat {}) _ = error ""
+
+isDone :: Event -> State Ty Bool
+isDone ev = do
+    t <- get
+    put (deriv t ev)
+    return (isNull (deriv t ev))
+
+isNotDone ev = not <$> isDone ev
+
+varIsNotDone x (TEV y ev) | x == y = isNotDone ev
+varIsNotDone x (TEV y ev) = return True
+
+peelTag x (TEV y ev) | x == y = Just ev
+peelTag x (TEV y ev) = Nothing
+
+derivStream :: Ty -> Stream Event -> Stream Ty
+derivStream t0 (S (SF x0 next)) = S (SF (x0,t0) next')
+    where
+        next' (next -> Done,t) = Done
+        next' (next -> Skip x,t) = Skip (x,t)
+        next' (next -> Yield ev x,t) =
+            let t' = deriv t ev in
+            Yield t' (x,t')
+
+varTake :: String -> Ty -> Stream TaggedEvent -> Stream Event
+varTake x t0 (S (SF x0 next)) = S (SF (x0,t0,False) next')
+    where
+        next' (_,_,True) = Done
+        next' (next -> Done,_,_) = Done
+        next' (next -> Skip x',t,_) = Skip (x',t,False)
+        next' (next -> Yield (TEV y ev) x',t,_) | y /= x = Skip (x',t,False)
+        next' (next -> Yield (TEV y ev) x',t,_) | y == x =
+            let t' = deriv t ev in
+            Yield ev (x',t',isNull t')
+
+varDrop :: String -> Ty -> Stream TaggedEvent -> Stream TaggedEvent
+varDrop x t0 (S (SF x0 next)) = S (SF (x0,t0,False) next')
+    where
+        next' (next -> Done,_,True) = Done
+        next' (next -> Skip x',t,True) = Skip (x',t,True)
+        next' (next -> Yield tev x',t,True) = Yield tev (x',t,True)
+
+        next' (next -> Done,_,False) = Done
+        next' (next -> Skip x',t,False) = Skip (x',t,False)
+        next' (next -> Yield (TEV y ev) x',t,False) | y /= x = Skip (x',t,False)
+        next' (next -> Yield (TEV y ev) x',t,False) | y == x =
+            let t' = deriv t ev in
+            Skip (x',t',isNull t')
+
+denote :: Term -> Stream TaggedEvent -> (Stream Event, Stream TaggedEvent)
+denote EpsR s = (mempty,s)
+denote (IntR n) s = (scons (IntEv n) mempty,s)
+denote (Var x t) s = (varTake x t s,varDrop x t s)
+
 denote (IntCase x e1 e2) s =
-    let s' = sdropWhile (\(TEV y _) -> y /= x) s in
-    let (syes,sno) = sIf ifz s' in
-    _ -- denote e1 (stail syes) <> denote e2 (sapplyFirst intPred sno)
+    let startOfX = sdropWhile (\(TEV y _) -> y /= x) s in
+    let (e1out,e1rest) = denote e1 (stail startOfX) in
+    let (e2out,e2rest) = denote e2 (sapplyFirst intPred startOfX) in
+    (sIf ifz startOfX e1out e2out,sIf ifz startOfX e1rest e2rest)
         where
             ifz (TEV _ (IntEv 0)) = True
             ifz (TEV _ (IntEv _)) = False
             intPred (TEV x (IntEv n)) = TEV x (IntEv (n - 1))
 
-denote (CatL x y z e) s = denote e (sstatefulmap False go s)
+denote (CatL x y z e) s = denote e (sstatefulmap False (undefined go) s)
     where
         go (TEV z' (CatEvA ev)) False | z == z' = (False,Just (TEV x ev))
         go (TEV z' CatPunc) False | z == z' = (True,Nothing)
         go (TEV z' ev) True | z == z' = (True,Just (TEV y ev))
         go tev@(TEV {}) b = (b,Just tev)
 
--- denote (Cons e1 e2) s@(S @st x0 f) =
---     let r = denote e1 s in
---     let u = \x' -> denote e2 (S x' f) in
---     S _ _
---     run e1
-
--- denote (TmCatR _ e1 e2) = switch (denote e1 >>^ maximalPass) (\p -> applyToFirst id (CatPB p) (denote e2))
---     where
---         maximalPass p = (CatPA p,if isMaximal p then Just p else Nothing)
+denote (CatR _ e1 e2) s =
+    let (e1out,srest) = denote e1 s in
+    let (e2out,srest') = denote e2 srest in
+    (fmap CatEvA e1out <> pure CatPunc <> e2out,srest')
 
 main = return ()
+
+data Chan = VarChan String | Proj1Chan Chan | Proj2Chan Chan
+
+data Autom where
+    Stop :: Autom
+    Output :: Int -> Autom
+    UseChan :: Chan -> Ty -> Autom
+    IfZ :: Chan -> Autom -> Autom -> Autom
+    Then :: Ty -> Autom -> Autom -> Autom
+
+t2a :: Term -> Autom
+t2a e = go mempty e
+    where
+        getChan m x = case Map.lookup x m of
+                      Nothing -> VarChan x
+                      Just c -> c
+        go _ EpsR = Stop
+        go _ (IntR n) = Output n
+        go m (Var x s) = UseChan (getChan m x) s
+        go m (IntCase z e1 e2) =
+            let c = getChan m z in
+            IfZ c (go m e1) (go m e2)
+        go m (CatR s e1 e2) = Then s (go m e1) (go m e2)
+        go m (CatL x y z e) =
+            let c = getChan m z in
+            go (Map.insert x (Proj1Chan c) (Map.insert y (Proj2Chan c) m)) e
+
+denoteAutom :: Autom -> StreamFunc s TaggedEvent -> StreamFunc (s,Autom) Event
+denoteAutom e (SF x0 next_in) = SF (x0,e) next
+    where
+
+        nextFromChan x' (VarChan x) =
+            (case next_in x' of
+                Done -> Done
+                Skip x'' -> Skip x''
+                Yield (TEV z ev) x'' -> if z == x then Yield ev x'' else Skip x'', VarChan x)
+        nextFromChan x' (Proj1Chan c) =
+            case nextFromChan x' c of
+                (Done,c') -> (Done,Proj1Chan c')
+                (Skip x'',c') -> (Skip x'',Proj1Chan c')
+                (Yield (CatEvA ev) x'',c') -> (Yield ev x'', Proj1Chan c')
+                (Yield {},_)-> error ""
+        nextFromChan x' (Proj2Chan c) =
+                case nextFromChan x' c of
+                (Done,c') -> (Done,Proj2Chan c')
+                (Skip x'',c') -> (Skip x'',Proj2Chan c')
+                (Yield CatPunc x'',c') -> (Skip x'', c') -- peel off the proj2. this is probably not an ideal way to do this, but oh well. should really be in-place.
+                (Yield {},_)-> error ""
+
+        next (x',e@(UseChan c s)) =
+            if isNull s
+            then Done
+            else 
+                case nextFromChan x' c of
+                    (Done,c') -> Done
+                    (Skip x'',c') -> Skip (x'',UseChan c' s)
+                    (Yield ev x'',c') -> Yield ev (x'',UseChan c' (deriv s ev))
+
+        next (x',Output n) = Yield (IntEv n) (x',Stop)
+
+        next (x',Stop) = Done
+
+        next (x',IfZ c e1 e2) =
+            case nextFromChan x' c of
+                (Done,c') -> Done
+                (Skip x',c') -> Skip (x',IfZ c' e1 e2)
+                (Yield (IntEv 0) x',_) -> Skip (x',e1)
+                (Yield (IntEv _) x',_) -> Skip (x',e2)
+
+        next (x',Then s e1 e2) =
+            if isNull s then Yield CatPunc (x',e2)
+            else case next (x',e1) of
+                Done -> Skip (x',e2)
+                Skip (x'',e1') -> Skip (x'',Then s e1' e2)
+                Yield ev (x'',e1') -> Yield (CatEvA ev) (x'',Then (deriv s ev) e1' e2)
+
+{-
+
+G |-_{G |- e} e : s
+--------------------
+G |-_{...} fix e : s
+
+
+---------------------
+G |-_{G |- s} rec : s
+
+-}
