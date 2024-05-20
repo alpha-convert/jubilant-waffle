@@ -14,6 +14,9 @@ import Control.Monad.State.Strict
 import Data.Maybe (fromMaybe)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Distribution.Compat.Lens (_1)
+
+main = return ()
 
 {- Inspired by "Stream Fusion" -}
 
@@ -304,28 +307,66 @@ instance Functor Stream where
             (next -> Skip x) -> Skip x
             (next -> Yield a x) -> Yield (f a) x
 
-data Ty = TyEps | TyInt | TyCat Ty Ty deriving (Eq,Ord,Show)
+data Ty = TyEps | TyInt | TyCat Ty Ty | TyPlus Ty Ty | TyStar Ty deriving (Eq,Ord,Show)
 
 isNull :: Ty -> Bool
 isNull TyEps = True
 isNull TyInt = False
 isNull (TyCat {}) = False
+isNull (TyPlus {}) = False
+isNull (TyStar {}) = False
 
 data Term where
+    {-
+    --------------
+    G |- EpsR : eps
+    -}
     EpsR :: Term
-    IntR :: Int -> Term
+    {-
+    -----------------------
+    G;x:s;G' |- Var x s : s
+    -}
     Var :: String -> Ty -> Term
-    IntCase :: String -> Term -> Term -> Term
+    {-
+    -----------------
+    G |- IntR n : Int
+    -}
+    IntR :: Int -> Term
+    {-
+    G' |- e1 : s
+    y:Int;G' |- e2 : s
+    ------------------------------------
+    G;x:Int;G' |- IntCase x e1 y e2 : s
+    -}
+
+    IntCase :: String -> Term -> String -> Term -> Term
+
+    {-
+    G;x:s;y:t;G' |- e : r
+    ----------------------------
+    G;z:s.t;G' |- CatL x y z e : r
+    -}
     CatL :: String -> String -> String -> Term -> Term
+    {-
+    G |- e1 : s
+    D |- e2 : t
+    ----------------------
+    G;D |- (e1;e2) : s . t
+    -}
     CatR :: Ty -> Term -> Term -> Term
+    {-
+    -}
+    InL :: Term -> Term
+    InR :: Term -> Term
+    PlusCase :: String -> String -> Term -> String -> Term -> Term
+    Nil :: Term
+    Cons :: Term -> Term -> Term
+    StarCase :: String -> Term -> String -> String -> Term -> Term
+    Fix :: Term -> Term
+    Rec :: Term
+    deriving (Eq,Ord,Show)
 
-data Event = IntEv Int | CatEvA Event | CatPunc deriving (Eq,Ord,Show)
-    -- IntEv :: Int -> Event
-    -- ListEvDone :: Event
-    -- ListEvNext :: Event
-    -- CatEvA :: Event -> Event
-    -- CatPunc :: Event
-
+data Event = IntEv Int | CatEvA Event | CatPunc | PlusPuncA | PlusPuncB deriving (Eq,Ord,Show)
 
 data TaggedEvent = TEV String Event deriving (Eq,Ord,Show)
 
@@ -336,167 +377,295 @@ deriv TyInt _ = error ""
 deriv (TyCat s t) (CatEvA ev) = TyCat (deriv s ev) t
 deriv (TyCat _ t) CatPunc = t
 deriv (TyCat {}) _ = error ""
+deriv (TyPlus s _) PlusPuncA = s
+deriv (TyPlus _ t) PlusPuncB = t
+deriv (TyPlus {}) _ = error ""
+deriv (TyStar _) PlusPuncA = TyEps
+deriv (TyStar s) PlusPuncB = TyCat s (TyStar s)
+deriv (TyStar {}) _ = error ""
 
-isDone :: Event -> State Ty Bool
-isDone ev = do
-    t <- get
-    put (deriv t ev)
-    return (isNull (deriv t ev))
-
-isNotDone ev = not <$> isDone ev
-
-varIsNotDone x (TEV y ev) | x == y = isNotDone ev
-varIsNotDone x (TEV y ev) = return True
-
-peelTag x (TEV y ev) | x == y = Just ev
-peelTag x (TEV y ev) = Nothing
-
-derivStream :: Ty -> Stream Event -> Stream Ty
-derivStream t0 (S (SF x0 next)) = S (SF (x0,t0) next')
-    where
-        next' (next -> Done,t) = Done
-        next' (next -> Skip x,t) = Skip (x,t)
-        next' (next -> Yield ev x,t) =
-            let t' = deriv t ev in
-            Yield t' (x,t')
-
-varTake :: String -> Ty -> Stream TaggedEvent -> Stream Event
-varTake x t0 (S (SF x0 next)) = S (SF (x0,t0,False) next')
-    where
-        next' (_,_,True) = Done
-        next' (next -> Done,_,_) = Done
-        next' (next -> Skip x',t,_) = Skip (x',t,False)
-        next' (next -> Yield (TEV y ev) x',t,_) | y /= x = Skip (x',t,False)
-        next' (next -> Yield (TEV y ev) x',t,_) | y == x =
-            let t' = deriv t ev in
-            Yield ev (x',t',isNull t')
-
-varDrop :: String -> Ty -> Stream TaggedEvent -> Stream TaggedEvent
-varDrop x t0 (S (SF x0 next)) = S (SF (x0,t0,False) next')
-    where
-        next' (next -> Done,_,True) = Done
-        next' (next -> Skip x',t,True) = Skip (x',t,True)
-        next' (next -> Yield tev x',t,True) = Yield tev (x',t,True)
-
-        next' (next -> Done,_,False) = Done
-        next' (next -> Skip x',t,False) = Skip (x',t,False)
-        next' (next -> Yield (TEV y ev) x',t,False) | y /= x = Skip (x',t,False)
-        next' (next -> Yield (TEV y ev) x',t,False) | y == x =
-            let t' = deriv t ev in
-            Skip (x',t',isNull t')
-
-denote :: Term -> Stream TaggedEvent -> (Stream Event, Stream TaggedEvent)
-denote EpsR s = (mempty,s)
-denote (IntR n) s = (scons (IntEv n) mempty,s)
-denote (Var x t) s = (varTake x t s,varDrop x t s)
-
-denote (IntCase x e1 e2) s =
-    let startOfX = sdropWhile (\(TEV y _) -> y /= x) s in
-    let (e1out,e1rest) = denote e1 (stail startOfX) in
-    let (e2out,e2rest) = denote e2 (sapplyFirst intPred startOfX) in
-    (sIf ifz startOfX e1out e2out,sIf ifz startOfX e1rest e2rest)
-        where
-            ifz (TEV _ (IntEv 0)) = True
-            ifz (TEV _ (IntEv _)) = False
-            intPred (TEV x (IntEv n)) = TEV x (IntEv (n - 1))
-
-denote (CatL x y z e) s = denote e (sstatefulmap False (undefined go) s)
-    where
-        go (TEV z' (CatEvA ev)) False | z == z' = (False,Just (TEV x ev))
-        go (TEV z' CatPunc) False | z == z' = (True,Nothing)
-        go (TEV z' ev) True | z == z' = (True,Just (TEV y ev))
-        go tev@(TEV {}) b = (b,Just tev)
-
-denote (CatR _ e1 e2) s =
-    let (e1out,srest) = denote e1 s in
-    let (e2out,srest') = denote e2 srest in
-    (fmap CatEvA e1out <> pure CatPunc <> e2out,srest')
-
-main = return ()
-
-data Chan = VarChan String | Proj1Chan Chan | Proj2Chan Chan
-
-data Autom where
-    Stop :: Autom
-    Output :: Int -> Autom
-    UseChan :: Chan -> Ty -> Autom
-    IfZ :: Chan -> Autom -> Autom -> Autom
-    Then :: Ty -> Autom -> Autom -> Autom
-
-t2a :: Term -> Autom
-t2a e = go mempty e
-    where
-        getChan m x = case Map.lookup x m of
-                      Nothing -> VarChan x
-                      Just c -> c
-        go _ EpsR = Stop
-        go _ (IntR n) = Output n
-        go m (Var x s) = UseChan (getChan m x) s
-        go m (IntCase z e1 e2) =
-            let c = getChan m z in
-            IfZ c (go m e1) (go m e2)
-        go m (CatR s e1 e2) = Then s (go m e1) (go m e2)
-        go m (CatL x y z e) =
-            let c = getChan m z in
-            go (Map.insert x (Proj1Chan c) (Map.insert y (Proj2Chan c) m)) e
-
-denoteAutom :: Autom -> StreamFunc s TaggedEvent -> StreamFunc (s,Autom) Event
-denoteAutom e (SF x0 next_in) = SF (x0,e) next
-    where
-
-        nextFromChan x' (VarChan x) =
-            (case next_in x' of
-                Done -> Done
-                Skip x'' -> Skip x''
-                Yield (TEV z ev) x'' -> if z == x then Yield ev x'' else Skip x'', VarChan x)
-        nextFromChan x' (Proj1Chan c) =
-            case nextFromChan x' c of
-                (Done,c') -> (Done,Proj1Chan c')
-                (Skip x'',c') -> (Skip x'',Proj1Chan c')
-                (Yield (CatEvA ev) x'',c') -> (Yield ev x'', Proj1Chan c')
-                (Yield {},_)-> error ""
-        nextFromChan x' (Proj2Chan c) =
-                case nextFromChan x' c of
-                (Done,c') -> (Done,Proj2Chan c')
-                (Skip x'',c') -> (Skip x'',Proj2Chan c')
-                (Yield CatPunc x'',c') -> (Skip x'', c') -- peel off the proj2. this is probably not an ideal way to do this, but oh well. should really be in-place.
-                (Yield {},_)-> error ""
-
-        next (x',e@(UseChan c s)) =
-            if isNull s
-            then Done
-            else 
-                case nextFromChan x' c of
-                    (Done,c') -> Done
-                    (Skip x'',c') -> Skip (x'',UseChan c' s)
-                    (Yield ev x'',c') -> Yield ev (x'',UseChan c' (deriv s ev))
-
-        next (x',Output n) = Yield (IntEv n) (x',Stop)
-
-        next (x',Stop) = Done
-
-        next (x',IfZ c e1 e2) =
-            case nextFromChan x' c of
-                (Done,c') -> Done
-                (Skip x',c') -> Skip (x',IfZ c' e1 e2)
-                (Yield (IntEv 0) x',_) -> Skip (x',e1)
-                (Yield (IntEv _) x',_) -> Skip (x',e2)
-
-        next (x',Then s e1 e2) =
-            if isNull s then Yield CatPunc (x',e2)
-            else case next (x',e1) of
-                Done -> Skip (x',e2)
-                Skip (x'',e1') -> Skip (x'',Then s e1' e2)
-                Yield ev (x'',e1') -> Yield (CatEvA ev) (x'',Then (deriv s ev) e1' e2)
-
+{- Are Elims just a focusing thing? -}
+data Elim = VarElim String
+          | Proj1Elim Elim
+          | Proj2Elim Elim
+          deriving (Eq,Ord,Show)
 {-
 
-G |-_{G |- e} e : s
---------------------
-G |-_{...} fix e : s
+Elimnel tying:
 
+-------------------------
+G;x:s;G' |- VarElim x : s
 
+G |- c : s . t
 ---------------------
-G |-_{G |- s} rec : s
+G |- Proj1Elim c : s
+
+G |- c : s . t
+---------------------
+G |- Proj2Elim c : t
 
 -}
+
+{- Removes all Pi2s from an eliminator. If we've gotten at least one event through an eliminator, it has to have no more pi2s in it... -}
+delPi2 :: Elim -> Elim
+delPi2 (VarElim x) = VarElim x
+delPi2 (Proj1Elim c) = Proj1Elim (delPi2 c)
+delPi2 (Proj2Elim c) = delPi2 c
+
+{- if elim is an eliminator with underlying variable x, and ev is an event from the channel x,
+then elimDeriv elim ev is the eliminator updated after the event
+-}
+
+{- absolutely no idea how i came up with the code for this. -}
+elimDeriv :: Elim -> Event -> Elim
+elimDeriv el ev = go el ev const
+    where
+        go (VarElim x) ev k = k (VarElim x) (Just ev)
+        go (Proj1Elim el) ev k = go el ev (\el' ev ->
+            case ev of
+                Nothing -> k (Proj1Elim el') Nothing
+                Just (CatEvA ev') -> k (Proj1Elim el') (Just ev')
+         )
+        go (Proj2Elim el) ev k = go el ev (\el' ev ->
+            case ev of
+                Nothing -> k (Proj2Elim el') Nothing
+                Just (CatEvA _) -> k (Proj2Elim el') Nothing
+                Just CatPunc -> k el' Nothing
+         )
+
+
+data ElimTerm =
+      EEpsR
+    | EUse Elim Ty
+    | EIntR Int
+    | ECatR ElimTerm ElimTerm
+    | EInR ElimTerm
+    | EInL ElimTerm
+    | EPlusCase Elim ElimTerm ElimTerm
+    | ENil
+    | ECons ElimTerm ElimTerm
+    | EFix ElimTerm
+    | ERec
+    deriving (Eq,Ord,Show)
+
+fixSubst :: ElimTerm -> ElimTerm -> ElimTerm
+fixSubst = undefined
+
+inlineElims :: Term -> ElimTerm
+inlineElims e = go mempty e
+    where
+        getElim m x = case Map.lookup x m of
+                      Nothing -> VarElim x
+                      Just c -> c
+        go _ EpsR = EEpsR
+        go _ (IntR n) = EIntR n
+        go m (Var x s) = EUse (getElim m x) s
+        -- go m (IntCase z e1 y e2) =
+        --     let c = getElim m z in
+        --     EIntCase c (go m e1) (go (Map.insert y (PredElim (delPi2 c)) m) e2)
+        go m (CatR s e1 e2) = ECatR (go m e1) (go m e2)
+        go m (CatL x y z e) =
+            let c = getElim m z in
+            go (Map.insert x (Proj1Elim c) (Map.insert y (Proj2Elim c) m)) e
+        go m (InL e) = EInL (go m e)
+        go m (InR e) = EInR (go m e)
+        go m (PlusCase z x e1 y e2) =
+            let c = getElim m z in
+            EPlusCase c (go (Map.insert x (delPi2 c) m) e1) (go (Map.insert y (delPi2 c) m) e2)
+        go m Nil = ENil
+        go m (Cons e1 e2) = ECons (go m e1) (go m e2)
+        go m (StarCase z e1 x xs e2) =
+            let c = getElim m z in
+            EPlusCase c (go (Map.insert x (Proj1Elim (delPi2 c)) m) e1) (go (Map.insert xs (Proj2Elim (delPi2 c)) m) e2)
+
+denoteElimTerm :: ElimTerm -> StreamFunc s TaggedEvent -> StreamFunc (s,ElimTerm) Event
+denoteElimTerm e (SF x0 next_in) = SF (x0,e) next
+    where
+        nextFromElim x' (VarElim x) =
+            case next_in x' of
+                Done -> Done
+                Skip x'' -> Skip (x'',VarElim x)
+                Yield (TEV z ev) x'' -> if z == x then Yield ev (x'',VarElim x) else Skip (x'',VarElim x)
+
+        nextFromElim x' (Proj1Elim c) =
+            case nextFromElim x' c of
+                Done -> Done
+                Skip (x'',c') -> Skip (x'',Proj1Elim c')
+
+
+                Yield (CatEvA ev) (x'',c') -> Yield ev (x'', Proj1Elim c')
+
+
+                Yield {} -> error ""
+        nextFromElim x' (Proj2Elim c) =
+                case nextFromElim x' c of
+                    Done -> Done
+                    Skip (x'',c') -> Skip (x'',Proj2Elim c')
+                    Yield (CatEvA _) (x'',c') -> Skip (x'', Proj2Elim c')
+
+                    Yield CatPunc (x'',c') -> Skip (x'', c') -- peel off the proj2. this is probably not an ideal way to do this, but oh well. should really be in-place.
+
+                    Yield {} -> error ""
+
+        next (x',e@(EUse c s)) =
+            if isNull s
+            then Done
+            else case nextFromElim x' c of
+                    Done -> Done
+                    Skip (x'',c') -> Skip (x'',EUse c' s)
+                    Yield ev (x'',c') -> Yield ev (x'',EUse c' (deriv s ev))
+
+        next (x',EIntR n) = Yield (IntEv n) (x',EEpsR)
+
+        next (x',EEpsR) = Done
+
+        next (x',ECatR e1 e2) =
+            case next (x',e1) of
+                Skip (x'',e1') -> Skip (x'',ECatR e1' e2)
+                Done -> Yield CatPunc (x',e2)
+                Yield ev (x'',e1') -> Yield (CatEvA ev) (x'',ECatR e1' e2)
+
+        next (x',EInL e) = Yield PlusPuncA (x',e)
+        next (x',EInR e) = Yield PlusPuncB (x',e)
+
+        next (x',EPlusCase c e1 e2) =
+            case nextFromElim x' c of
+                Done -> Done
+                Skip (x',c') -> Skip (x',EPlusCase c' e1 e2)
+                Yield PlusPuncA (x',_) -> Skip (x',e1)
+                Yield PlusPuncB (x',_) -> Skip (x',e2)
+
+        next (x', ENil) = Yield PlusPuncA (x',EEpsR)
+        next (x', ECons e1 e2) = Yield PlusPuncB (x',ECatR e1 e2)
+
+        next (x', EFix e) = Skip (x', fixSubst (EFix e) e)
+        next (x', ERec) = error ""
+
+denoteElimTerm' a (S sf) = S (denoteElimTerm a sf)
+
+type StateId = Int
+
+data EventShape = ESIntEv | ESCatEvA EventShape | ESCatPunc | ESPlusPuncA | ESPlusPuncB deriving (Eq,Ord,Show)
+
+shapeOf :: Event -> EventShape
+shapeOf (IntEv _) = ESIntEv
+shapeOf (CatEvA ev) = ESCatEvA (shapeOf ev)
+shapeOf CatPunc = ESCatPunc
+shapeOf PlusPuncA = ESPlusPuncA
+shapeOf PlusPuncB = ESPlusPuncB
+
+data OutputModifier = OId | AddCatEvA OutputModifier
+
+data ReadyElim = VarReadyElim String | Proj1ReadyElim ReadyElim {- these are fully-deriv'd elims: the next event you pull on the underlying channel has to be for for it.  -}
+
+applyOutputModifier :: OutputModifier -> Event -> Event
+applyOutputModifier OId = id
+applyOutputModifier (AddCatEvA om) = CatEvA . applyOutputModifier om
+
+data Action =
+      SStop
+    | SPrepareElim String (Map EventShape StateId) -- state in which you chew off data for a the elim until it's ``ready''
+    | SForwardInput ReadyElim OutputModifier (Map EventShape StateId)
+    | SOutput Event StateId
+    | SBranch ReadyElim StateId StateId
+    | SJump StateId
+
+addCatEvA SStop = SStop
+addCatEvA a@(SPrepareElim {}) = a
+addCatEvA (SForwardInput el om jt) = SForwardInput el (AddCatEvA om) jt
+addCatEvA (SOutput ev j) = SOutput (CatEvA ev) j
+addCatEvA a@(SBranch {}) = a
+addCatEvA a@(SJump {}) = a
+
+data Autom = A { states :: Map StateId Action }
+
+buildAutom :: ElimTerm -> (Int,Autom)
+buildAutom e = let (init,states) = fst (runState (go (-1) e) (0,Nothing)) in (init,A states)
+    where
+        freshStateId :: State (Int,Maybe Int) Int
+        freshStateId = do
+            (n,mf) <- get
+            put (n+1,mf)
+            return n
+        getFixStart :: State (Int,Maybe Int) Int
+        getFixStart = do
+            (n,mf) <- get
+            return (fromMaybe (error "") mf)
+        setFixStart f = do
+            (n,mf) <- get
+            put (n, Just f)
+        eraseFixStart :: State (Int,Maybe Int) ()
+        eraseFixStart = do { (n,_) <- get; put (n, Nothing)}
+
+        go end EEpsR = do
+            n <- freshStateId
+            return (n,Map.singleton n (SJump end))
+        go end (EUse elim ty) = _
+        go end (EIntR k) = do
+            n <- freshStateId
+            return (n,Map.singleton n (SOutput (IntEv k) end))
+        go end (ECatR e1 e2) = do
+            puncNode <- freshStateId
+            (e1start,m1) <- go puncNode e1
+            (e2start,m2) <- go end e2
+            let m1' = fmap addCatEvA m1
+            return (e1start,Map.insert puncNode (SOutput CatPunc e2start) (Map.union m1' m2))
+        go end (EInL e) = do
+            puncNode <- freshStateId
+            (estart,m) <- go end e
+            return (puncNode,Map.insert puncNode (SOutput PlusPuncA estart) m)
+        go end (EInR e) = do
+            puncNode <- freshStateId
+            (estart,m) <- go end e
+            return (puncNode,Map.insert puncNode (SOutput PlusPuncB estart) m)
+
+        go end (EFix e) = do
+            fixStart <- freshStateId
+            setFixStart fixStart
+            (estart, m) <- go end e
+            eraseFixStart
+            return (fixStart, Map.insert fixStart (SJump estart) m)
+        go end ERec = do
+            recNode <- freshStateId
+            fixAddr <- getFixStart
+            return (recNode, Map.singleton recNode (SJump fixAddr))
+
+denoteAutom :: StateId -> Autom -> StreamFunc s TaggedEvent -> StreamFunc (s,Int) Event
+denoteAutom n (A m) (SF x0 next_in) = SF (x0,n) go
+    where
+        go (x,n) = let action = Map.lookup n m in next x n (fromMaybe (error "") action)
+
+        nextFromVar x' var =
+            case next_in x' of
+                Done -> Done
+                Skip x'' -> Skip x''
+                Yield (TEV z ev) x'' -> if z == var then Yield ev x'' else Skip x''
+
+        nextFromReadyElim x' (VarReadyElim x) = nextFromVar x' x
+        nextFromReadyElim x' (Proj1ReadyElim c) =
+            case nextFromReadyElim x' c of
+                Done -> Done
+                Skip x'' -> Skip x''
+                Yield (CatEvA ev) x'' -> Yield ev x''
+                Yield {} -> error ""
+
+        next x _ SStop = Done
+        next x n (SPrepareElim var jumpTable) =
+            case nextFromVar x var of
+                Done -> Done
+                Skip x' -> Skip (x',n)
+                Yield ev x' ->
+                    let jumpTarget = fromMaybe (error "") (Map.lookup (shapeOf ev) jumpTable) in
+                    Skip (x',jumpTarget)
+
+        next x _ (SOutput ev n') = Yield ev (x,n')
+        next x n (SBranch re t1 t2) =
+            case nextFromReadyElim x re of
+                Done -> Done
+                Skip x' -> Skip (x',n)
+                Yield PlusPuncA x' -> Skip (x',t1)
+                Yield PlusPuncB x' -> Skip (x',t2)
+
+        next x _ (SJump n') = Skip (x,n')
+
+
